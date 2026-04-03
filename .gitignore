@@ -1,2 +1,10 @@
-***__pycache__
-*.sif
+*.txt
+core.*
+*.json
+*.rviz
+recordings/
+__pycache__/
+*.pyc
+dashboard.py
+restart_dashboard.sh
+*.md
