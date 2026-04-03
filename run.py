@@ -97,28 +97,16 @@ if __name__ == "__main__":
     ## (Customize this block to add your own navigation stack)
     ##########################################################################################
 
-    # A* global planner + DWA local planner via move_base
+    # Standalone A* planner — reads LIDAR directly, publishes /cmd_vel (no move_base)
+    rospy.set_param('init_position', INIT_POSITION)
+    rospy.set_param('goal_position', GOAL_POSITION)
+    rospy.set_param('world_idx', args.world_idx)
     nav_pkg_path = rospack.get_path('navigation_pkg')
-    launch_file = join(nav_pkg_path, 'launch', 'Astar_DWA_launch.launch')
+    launch_file = join(nav_pkg_path, 'launch', 'Astar_launch.launch')
     nav_stack_process = subprocess.Popen([
         'roslaunch',
         launch_file,
     ])
-
-    # Send goal to move_base
-    import actionlib
-    from geometry_msgs.msg import Quaternion
-    from move_base_msgs.msg import MoveBaseGoal, MoveBaseAction
-    nav_as = actionlib.SimpleActionClient('/move_base', MoveBaseAction)
-    mb_goal = MoveBaseGoal()
-    mb_goal.target_pose.header.frame_id = 'odom'
-    mb_goal.target_pose.pose.position.x = GOAL_POSITION[0]
-    mb_goal.target_pose.pose.position.y = GOAL_POSITION[1]
-    mb_goal.target_pose.pose.position.z = 0
-    mb_goal.target_pose.pose.orientation = Quaternion(0, 0, 0, 1)
-
-    nav_as.wait_for_server()
-    nav_as.send_goal(mb_goal)
 
 
 
