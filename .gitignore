@@ -8,3 +8,4 @@ __pycache__/
 dashboard.py
 restart_dashboard.sh
 *.md
+jackal_helper/urdf/
