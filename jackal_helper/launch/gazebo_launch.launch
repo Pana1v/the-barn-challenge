@@ -1,7 +1,7 @@
 <launch>
   <arg name="use_sim_time" default="true" />
-  <arg name="gui" default="true" />
-  <arg name="headless" default="false" />
+  <arg name="gui" default="false" />
+  <arg name="headless" default="true" />
   <arg name="world_name" default="$(find jackal_helper)/worlds/jackal_race.world" />
 
   <!-- Short-term hack to support the original front_laser:=true argument for spawning
@@ -38,15 +38,5 @@
   </include>
 
   <node pkg="jackal_helper" type="collision_publisher_node" name="collision_publisher_node" />
-
-  <!-- Foxglove bridge for live visualization -->
-  <node pkg="foxglove_bridge" type="foxglove_bridge" name="foxglove_bridge" output="log">
-    <param name="port" value="8765"/>
-  </node>
-
-  <!-- Overhead camera for dashboard viewing -->
-  <param name="overhead_camera_description" command="$(find xacro)/xacro '$(find jackal_helper)/urdf/overhead_camera.urdf.xacro'" />
-  <node name="overhead_camera_spawner" pkg="gazebo_ros" type="spawn_model"
-        args="-urdf -model overhead_camera -param overhead_camera_description -x 0 -y 6 -z 15 -P 1.5708" />
 
 </launch>
