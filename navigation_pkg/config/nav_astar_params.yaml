@@ -1,0 +1,30 @@
+nav_astar:
+  # Grid & Inflation
+  grid_resolution: 0.10     # coarser for speed with 12m grid
+  inflation_radius: 0.22
+  cost_radius: 0.40
+
+  # Controller
+  max_linear_vel: 1.5
+  max_angular_vel: 1.0
+  Kp_ang: 3.5
+  Kd_ang: 0.3
+  align_threshold: 1.0
+  accel_limit: 0.6
+
+  # Planning
+  replan_interval: 0.8
+  goal_tolerance: 0.01
+  checkpoint_reach_dist: 0.35
+
+  # Safety
+  safe_margin: 0.02
+  stop_clearance: 0.02
+  slow_clearance: 0.10
+
+  # Recovery
+  breadcrumb_spacing: 0.3
+  stuck_check_interval: 12.0
+  stuck_threshold: 0.3
+  recovery_max_time: 6.0
+  collision_stop_threshold: 12

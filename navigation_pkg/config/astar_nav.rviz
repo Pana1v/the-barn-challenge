@@ -1,0 +1,52 @@
+Panels:
+  - Class: rviz/Displays
+    Name: Displays
+  - Class: rviz/Views
+    Name: Views
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz/Grid
+      Name: Grid
+      Plane Cell Count: 20
+      Reference Frame: <Fixed Frame>
+      Value: true
+    - Class: rviz/RobotModel
+      Name: RobotModel
+      Robot Description: robot_description
+      Value: true
+    - Class: rviz/LaserScan
+      Name: LaserScan
+      Topic: /front/scan
+      Size (m): 0.03
+      Color: 255; 0; 0
+      Value: true
+    - Class: rviz/Map
+      Name: SLAM Map
+      Topic: /map
+      Color Scheme: map
+      Value: true
+    - Class: rviz/Path
+      Name: A* Path
+      Topic: /nav_astar/path
+      Color: 0; 255; 0
+      Line Style: Lines
+      Value: true
+    - Class: rviz/Axes
+      Name: Axes
+      Reference Frame: base_link
+      Length: 0.3
+      Value: true
+  Global Options:
+    Background Color: 48; 48; 48
+    Fixed Frame: odom
+  Tools:
+    - Class: rviz/Interact
+    - Class: rviz/MoveCamera
+  Views:
+    Current:
+      Class: rviz/TopDownOrtho
+      Name: TopDownOrtho
+      Scale: 30
+      Target Frame: base_link
+      Value: TopDownOrtho

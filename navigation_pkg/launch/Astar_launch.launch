@@ -1,0 +1,6 @@
+<launch>
+  <env name="ROSCONSOLE_FORMAT" value="[${severity}] ${message}" />
+
+  <rosparam file="$(find navigation_pkg)/config/nav_astar_params.yaml" command="load" />
+  <node pkg="navigation_pkg" type="nav_astar.py" name="nav_astar" output="screen" />
+</launch>

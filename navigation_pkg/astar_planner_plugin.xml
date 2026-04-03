@@ -1,0 +1,7 @@
+<library path="lib/libastar_global_planner">
+  <class name="astar_planner/AStarGlobalPlanner"
+         type="astar_planner::AStarGlobalPlanner"
+         base_class_type="nav_core::BaseGlobalPlanner">
+    <description>A* global planner with path smoothing for BARN challenge</description>
+  </class>
+</library>
