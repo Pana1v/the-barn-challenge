@@ -16,6 +16,9 @@
 #include <nav_msgs/Path.h>
 #include <nav_msgs/OccupancyGrid.h>
 #include <tf/transform_listener.h>
+#include <tf/transform_broadcaster.h>
+#include <robot_localization/SetPose.h>
+#include <visualization_msgs/MarkerArray.h>
 
 #include <Eigen/Dense>
 
@@ -93,12 +96,37 @@ public:
         recovery_max_time_ = p_double("recovery_max_time", 8.0);
         collision_stop_threshold_ = p_int("collision_stop_threshold", 12);
 
-        robot_radius_      = std::hypot(0.42 / 2.0, 0.31 / 2.0); // 0.261m
-        control_radius_    = robot_radius_;  // 0.261m — match actual robot diagonal
-        proj_dt_           = 0.1;
-        proj_horizon_      = 0.8;
-        proj_clearance_    = 0.04;
-        max_ang_accel_     = 4.0;
+        {
+            bool v;
+            if (pnh.getParam("repeat_breadcrumb", v)) repeat_breadcrumb_ = v;
+            else if (nh.getParam("nav_astar/repeat_breadcrumb", v)) repeat_breadcrumb_ = v;
+            else repeat_breadcrumb_ = false;
+        }
+
+        // Hybrid A* params
+        hybrid_step_       = p_double("hybrid_step_size", 0.30);
+        hybrid_num_steer_  = p_int("hybrid_num_steer", 5);
+        hybrid_heading_bins_ = p_int("hybrid_heading_bins", 72);
+        hybrid_max_steer_  = p_double("hybrid_max_steer", 0.8);
+        hybrid_analytic_dist_ = p_double("hybrid_analytic_dist", 1.5);
+        analytic_heading_tol_ = p_double("analytic_heading_tol", 1.0);
+        analytic_cost_limit_ = p_double("analytic_cost_limit", 0.3);
+        obstacle_cost_weight_ = p_double("obstacle_cost_weight", 15.0);
+        steer_penalty_     = p_double("steer_penalty", 0.05);
+        h_weight_          = p_double("hybrid_h_weight", 0.5);
+        spin_recovery_threshold_ = p_int("spin_recovery_threshold", 40);
+
+        robot_length_      = p_double("robot_length", 0.42);
+        robot_width_       = p_double("robot_width", 0.31);
+        robot_radius_      = std::hypot(robot_length_ / 2.0, robot_width_ / 2.0);
+        // Control radius = half robot width (not inflation radius).
+        // Inflation keeps the planner's center away from walls;
+        // control radius is the actual footprint for collision checking.
+        control_radius_    = p_double("robot_width", 0.31) / 2.0;  // 0.155m
+        proj_dt_           = p_double("proj_dt", 0.1);
+        proj_horizon_      = p_double("proj_horizon", 0.4);
+        proj_clearance_    = p_double("proj_clearance", 0.04);
+        max_ang_accel_     = p_double("max_angular_accel", 4.0);
         prev_ang_vel_      = 0.0;
 
         // Goal from rosparam
@@ -108,6 +136,15 @@ public:
         }
         goal_x_ = goal_rel[0];
         goal_y_ = goal_rel[1];
+
+        // map→odom offset + spawn yaw for EKF correction
+        std::vector<double> init_pos;
+        if (!nh.getParam("init_position", init_pos) || init_pos.size() < 3) {
+            init_pos = {0.0, 0.0, 0.0};
+        }
+        map_origin_x_  = init_pos[0];
+        map_origin_y_  = init_pos[1];
+        spawn_yaw_     = init_pos[2];
 
         // State
         robot_x_ = robot_y_ = robot_yaw_ = 0.0;
@@ -123,15 +160,15 @@ public:
         stuck_check_init_ = false;
         in_recovery_ = false;
         recovery_start_ = 0.0;
-        recovery_target_valid_ = false;
+        recovery_trail_idx_ = 0;
         recovery_count_ = 0;
         plan_fail_count_ = 0;
         blend_ticks_ = 0;
 
         // Progress deadlock
         progress_time_init_ = false;
-        progress_window_  = 30.0;
-        progress_min_     = 0.5;
+        progress_window_  = p_double("progress_window", 15.0);
+        progress_min_     = p_double("progress_min", 0.3);
         deadlock_escape_  = false;
         escape_start_     = 0.0;
         escape_heading_   = 0.0;
@@ -142,17 +179,15 @@ public:
         laser_tx_ = laser_ty_ = laser_yaw_ = 0.0;
 
         // Grid
-        local_size_ = 12.0;
+        local_size_ = p_double("local_size", 12.0);
         grid_cells_ = static_cast<int>(local_size_ / grid_res_);
-
-        buildKernel();
 
         // Pub/Sub
         cmd_pub_      = nh.advertise<geometry_msgs::Twist>("/cmd_vel", 1);
         path_pub_     = nh.advertise<nav_msgs::Path>("/nav_astar/path", 1, true);
         costmap_pub_  = nh.advertise<nav_msgs::OccupancyGrid>("/astar/costmap", 1, true);
-        ctrl_costmap_pub_ = nh.advertise<nav_msgs::OccupancyGrid>("/astar/controller_costmap", 1, true);
-        steer_samples_pub_ = nh.advertise<nav_msgs::Path>("/astar/steer_samples", 1);
+        // ctrl_costmap removed — single costmap for planning + viz
+        marker_pub_   = nh.advertise<visualization_msgs::MarkerArray>("/astar/debug_markers", 1, true);
         scan_sub_     = nh.subscribe("/front/scan", 1, &AStarPlanner::scanCb, this);
 
         // Logger
@@ -161,23 +196,62 @@ public:
             if (stat("/tmp/nav_logs", &st) != 0) {
                 mkdir("/tmp/nav_logs", 0755);
             }
-            int wid = 0;
-            nh.param("/world_idx", wid, 0);
+            world_idx_ = 0;
+            nh.param("/world_idx", world_idx_, 0);
             char lp[256];
-            std::snprintf(lp, sizeof(lp), "/tmp/nav_logs/astar_w%d.csv", wid);
+            std::snprintf(lp, sizeof(lp), "/tmp/nav_logs/astar_w%d.csv", world_idx_);
             log_file_.open(lp, std::ios::out | std::ios::trunc);
-            log_file_ << "t,x,y,yaw,lv,av,obs,fwd,cl,tx,ty,ae,st,branch,pl,d2g,cstops,spins,pfails,rcnt\n";
+            log_file_ << "t,x,y,yaw,lv,av,obs,fwd,cl,tx,ty,ae,st,branch,pl,d2g,cstops,spins,pfails,rcnt,bc_cnt,trail\n";
         }
 
-        ROS_INFO("A* planner [C++]: goal(%.1f,%.1f) grid=%d inflation=%.3f cost=%.3f kernel=%zu",
-                 goal_x_, goal_y_, grid_cells_, inflation_radius_, cost_radius_, kernel_.size());
+        // Breadcrumb trail persistence
+        using_loaded_trail_ = false;
+        loaded_trail_idx_ = 0;
+        if (repeat_breadcrumb_) loadBreadcrumbs();
+
+        ROS_INFO("Hybrid A* planner [C++]: goal(%.1f,%.1f) grid=%d inflation=%.3f cost=%.3f step=%.2f steer=%d bins=%d",
+                 goal_x_, goal_y_, grid_cells_, inflation_radius_, cost_radius_,
+                 hybrid_step_, hybrid_num_steer_, hybrid_heading_bins_);
     }
 
     // -----------------------------------------------------------------------
     void run() {
         ros::Rate rate(20);
 
-        // Wait for scan + pose
+        // Correct EKF yaw FIRST, before any scan/pose data is used.
+        // The EKF starts at yaw=0 (Gazebo spawn) but run.py resets the
+        // robot to spawn_yaw via set_model_state. The EKF has no absolute
+        // yaw source, so it stays wrong. Inject the known spawn yaw now.
+        {
+            ros::ServiceClient set_pose_cli =
+                ros::NodeHandle().serviceClient<robot_localization::SetPose>(
+                    "/set_pose");
+            if (set_pose_cli.waitForExistence(ros::Duration(5.0))) {
+                robot_localization::SetPose srv;
+                srv.request.pose.header.frame_id = "odom";
+                srv.request.pose.header.stamp    = ros::Time::now();
+                srv.request.pose.pose.pose.position.x = 0.0;
+                srv.request.pose.pose.pose.position.y = 0.0;
+                srv.request.pose.pose.pose.position.z = 0.0;
+                double hy = spawn_yaw_ / 2.0;
+                srv.request.pose.pose.pose.orientation.z = std::sin(hy);
+                srv.request.pose.pose.pose.orientation.w = std::cos(hy);
+                srv.request.pose.pose.covariance[0]  = 0.5;   // x
+                srv.request.pose.pose.covariance[7]  = 0.5;   // y
+                srv.request.pose.pose.covariance[35] = 0.01;  // yaw ← tight
+                if (set_pose_cli.call(srv))
+                    ROS_INFO("A*: EKF yaw reset to spawn_yaw=%.2f rad", spawn_yaw_);
+                else
+                    ROS_WARN("A*: set_pose call failed — EKF yaw may be wrong");
+            } else {
+                ROS_WARN("A*: /set_pose service not available — EKF yaw uncorrected");
+            }
+            // Let EKF settle and new scans arrive with corrected TF
+            ros::Duration(1.0).sleep();
+            ros::spinOnce();
+        }
+
+        // Wait for scan + pose (now with correct yaw from start)
         while (ros::ok()) {
             ros::spinOnce();
             if (have_scan_ && getPose()) break;
@@ -187,11 +261,30 @@ public:
         ros::spinOnce();
         getPose();
 
+        // Wipe any stale markers from a previous run
+        {
+            visualization_msgs::MarkerArray clear;
+            visualization_msgs::Marker m;
+            m.header.frame_id = "map";
+            m.header.stamp = ros::Time::now();
+            m.action = visualization_msgs::Marker::DELETEALL;
+            clear.markers.push_back(m);
+            marker_pub_.publish(clear);
+        }
+
         ROS_INFO("A*: ready (%.2f,%.2f) yaw=%.2f -> goal(%.2f,%.2f)",
                  robot_x_, robot_y_, robot_yaw_, goal_x_, goal_y_);
 
         while (ros::ok()) {
             ros::spinOnce();
+
+            // Publish map→odom so RViz shows world-frame coordinates
+            tf::Transform map_to_odom;
+            map_to_odom.setOrigin(tf::Vector3(map_origin_x_, map_origin_y_, 0.0));
+            map_to_odom.setRotation(tf::Quaternion(0, 0, 0, 1));
+            map_tf_pub_.sendTransform(
+                tf::StampedTransform(map_to_odom, ros::Time::now(), "map", "odom"));
+
             if (!getPose()) {
                 rate.sleep();
                 continue;
@@ -200,6 +293,7 @@ public:
             double d2g = std::hypot(goal_x_ - robot_x_, goal_y_ - robot_y_);
             if (d2g < goal_tolerance_) {
                 ROS_INFO("A*: GOAL!");
+                saveBreadcrumbs();
                 geometry_msgs::Twist stop;
                 cmd_pub_.publish(stop);
                 break;
@@ -216,6 +310,9 @@ public:
                 doDeadlockEscape();
                 std::string esc_br = (escape_phase_ == 0) ? "esc_rot" : "esc_drive";
                 logRow(0, 0, obs_d, fc, cl, escape_heading_, 0, 0, "esc", esc_br, 0, d2g);
+                pubDebugMarkers(robot_x_ + 2.0 * std::cos(escape_heading_),
+                                robot_y_ + 2.0 * std::sin(escape_heading_),
+                                esc_br, normalizeAngle(escape_heading_ - robot_yaw_));
                 rate.sleep();
                 continue;
             }
@@ -230,30 +327,34 @@ public:
                 in_recovery_ = false;
                 doDeadlockEscape();
                 logRow(0, 0, obs_d, fc, cl, escape_heading_, 0, 0, "esc", "esc_init", 0, d2g);
+                pubDebugMarkers(robot_x_ + 2.0 * std::cos(escape_heading_),
+                                robot_y_ + 2.0 * std::sin(escape_heading_),
+                                "esc_init", normalizeAngle(escape_heading_ - robot_yaw_));
                 rate.sleep();
                 continue;
             }
 
             if (in_recovery_) {
                 doRecovery();
-                double rtx = recovery_target_valid_ ? recovery_target_x_ : 0.0;
-                double rty = recovery_target_valid_ ? recovery_target_y_ : 0.0;
+                double rtx = (!recovery_trail_.empty() && recovery_trail_idx_ < static_cast<int>(recovery_trail_.size())) ? recovery_trail_[recovery_trail_idx_].first : robot_x_;
+                double rty = (!recovery_trail_.empty() && recovery_trail_idx_ < static_cast<int>(recovery_trail_.size())) ? recovery_trail_[recovery_trail_idx_].second : robot_y_;
                 logRow(0, 0, obs_d, fc, cl, rtx, rty, 0, "rec", "rec_cont", 0, d2g);
+                pubDebugMarkers(rtx, rty, "rec_cont", 0.0);
                 rate.sleep();
                 continue;
             }
 
             // Trigger recovery: stuck, too many stops, or spinning
             bool was_stuck = checkStuck();
-            if (was_stuck || consecutive_stops_ >= collision_stop_threshold_ || spin_count_ >= 20) {
+            if (was_stuck || spin_count_ >= spin_recovery_threshold_) {
                 std::string reason;
                 if (was_stuck) reason = "rec_stuck";
-                else if (consecutive_stops_ >= collision_stop_threshold_) reason = "rec_stops";
                 else reason = "rec_spins";
                 doRecovery();
-                double rtx = recovery_target_valid_ ? recovery_target_x_ : 0.0;
-                double rty = recovery_target_valid_ ? recovery_target_y_ : 0.0;
+                double rtx = (!recovery_trail_.empty() && recovery_trail_idx_ < static_cast<int>(recovery_trail_.size())) ? recovery_trail_[recovery_trail_idx_].first : robot_x_;
+                double rty = (!recovery_trail_.empty() && recovery_trail_idx_ < static_cast<int>(recovery_trail_.size())) ? recovery_trail_[recovery_trail_idx_].second : robot_y_;
                 logRow(0, 0, obs_d, fc, cl, rtx, rty, 0, "rec", reason, 0, d2g);
+                pubDebugMarkers(rtx, rty, reason, 0.0);
                 rate.sleep();
                 continue;
             }
@@ -263,10 +364,29 @@ public:
             if (d2g < 2.0) {
                 tx = goal_x_;
                 ty = goal_y_;
+            } else if (using_loaded_trail_ && loaded_trail_idx_ < static_cast<int>(loaded_good_trail_.size())) {
+                // Follow loaded breadcrumb trail
+                auto& wp = loaded_good_trail_[loaded_trail_idx_];
+                double wd = std::hypot(wp.first - robot_x_, wp.second - robot_y_);
+                if (wd < checkpoint_dist_) {
+                    loaded_trail_idx_++;
+                    if (loaded_trail_idx_ >= static_cast<int>(loaded_good_trail_.size())) {
+                        using_loaded_trail_ = false;
+                        ROS_INFO("A*: loaded trail exhausted -- switching to A*");
+                    }
+                }
+                if (using_loaded_trail_) {
+                    tx = loaded_good_trail_[loaded_trail_idx_].first;
+                    ty = loaded_good_trail_[loaded_trail_idx_].second;
+                } else {
+                    tx = goal_x_;
+                    ty = goal_y_;
+                }
             } else {
                 double now = ros::Time::now().toSec();
                 double iv = std::min(replan_interval_, 1.0);
-                if (path_.empty() || path_idx_ >= static_cast<int>(path_.size()) - 1) {
+                if (path_.empty() || path_idx_ >= static_cast<int>(path_.size()) - 1
+                    || (now - last_plan_time_) >= iv) {
 
                     auto t0 = std::chrono::steady_clock::now();
                     bool ok = plan();
@@ -281,13 +401,14 @@ public:
                     } else {
                         last_plan_time_ = now - iv + 0.3;
                         plan_fail_count_++;
-                        if (plan_fail_count_ >= 3) {
+                        if (plan_fail_count_ >= 9) {
                             ROS_WARN("A*: %d plan failures -- retreating", plan_fail_count_);
                             plan_fail_count_ = 0;
                             doRecovery();
-                            double rtx = recovery_target_valid_ ? recovery_target_x_ : 0.0;
-                            double rty = recovery_target_valid_ ? recovery_target_y_ : 0.0;
+                            double rtx = (!recovery_trail_.empty() && recovery_trail_idx_ < static_cast<int>(recovery_trail_.size())) ? recovery_trail_[recovery_trail_idx_].first : 0.0;
+                            double rty = (!recovery_trail_.empty() && recovery_trail_idx_ < static_cast<int>(recovery_trail_.size())) ? recovery_trail_[recovery_trail_idx_].second : 0.0;
                             logRow(0, 0, obs_d, fc, cl, rtx, rty, 0, "rec", "rec_pfail", 0, d2g);
+                            pubDebugMarkers(rtx, rty, "rec_pfail", 0.0);
                             rate.sleep();
                             continue;
                         }
@@ -335,11 +456,11 @@ public:
                 double rot_margin = robot_radius_ + 0.04;
 
                 if (cl < 0.15) {
-                    spin_count_ = 20;
+                    spin_count_ += 3;
                     branch = "rot_tight";
                 } else if (f_d < rot_margin && turn_side_d < rot_margin) {
                     ROS_WARN_THROTTLE(2.0, "A*: surrounded (f=%.2f s=%.2f) -- retreating", f_d, turn_side_d);
-                    spin_count_ = 20;
+                    spin_count_ += 3;
                     branch = "rot_surr";
                 } else if (!rotationSafe((ae > 0 ? 1.0 : -1.0) * 1.5)) {
                     double rc = rearClear();
@@ -348,7 +469,7 @@ public:
                         ROS_INFO_THROTTLE(2.0, "A*: rotation unsafe, backing up");
                         branch = "rot_backup";
                     } else {
-                        spin_count_ += 6;
+                        spin_count_ += 3;
                         branch = "rot_trapped";
                     }
                 } else {
@@ -375,10 +496,6 @@ public:
                 sp = std::max(0.05, sp);
 
                 double raw_av = clampd(Kp_ang_ * ae, -max_ang_, max_ang_);
-                // Costmap clearance bias: steer toward lower-cost side
-                double cost_bias = costmapSteerBias();
-                raw_av += clampd(cost_bias * 0.8, -0.5, 0.5);
-                raw_av = clampd(raw_av, -max_ang_, max_ang_);
                 double dav = clampd(raw_av - prev_ang_vel_, -max_ang_accel_, max_ang_accel_);
                 double ac = prev_ang_vel_ + dav;
 
@@ -419,11 +536,32 @@ public:
             std::string st = (cmd.linear.x == 0.0 && cmd.angular.z == 0.0) ? "stp" : "nav";
             logRow(cmd.linear.x, cmd.angular.z, obs_d, fc, cl, tx, ty, ae, st, branch,
                    static_cast<int>(path_.size()), d2g);
+
+            // Live debug: goal distance, headings, branch
+            double goal_hdg = std::atan2(goal_y_ - robot_y_, goal_x_ - robot_x_);
+            double goal_ae  = normalizeAngle(goal_hdg - robot_yaw_);
+            ROS_INFO_THROTTLE(1.0,
+                "[SNAP] d2g=%.2fm  pos=(%.2f,%.2f)  yaw=%.1f°  "
+                "goal_hdg=%.1f°  goal_err=%.1f°  wp=(%.2f,%.2f)  wp_err=%.1f°  "
+                "obs=%.2f  lv=%.2f  av=%.2f  branch=%s  stops=%d  spins=%d",
+                d2g,
+                robot_x_, robot_y_,
+                robot_yaw_ * 180.0 / M_PI,
+                goal_hdg  * 180.0 / M_PI,
+                goal_ae   * 180.0 / M_PI,
+                tx, ty,
+                ae * 180.0 / M_PI,
+                obs_d,
+                cmd.linear.x, cmd.angular.z,
+                branch.c_str(),
+                consecutive_stops_, spin_count_);
+
             cmd_pub_.publish(cmd);
-            pubPath();
+            pubDebugMarkers(tx, ty, branch, ae);
             rate.sleep();
         }
 
+        saveBreadcrumbs();
         log_file_.close();
         geometry_msgs::Twist stop;
         cmd_pub_.publish(stop);
@@ -442,10 +580,24 @@ private:
     double recovery_max_time_;
     int    collision_stop_threshold_;
 
+    double robot_length_, robot_width_;
     double robot_radius_, control_radius_;
     double proj_dt_, proj_horizon_, proj_clearance_;
     double max_ang_accel_;
     double prev_ang_vel_;
+
+    // Hybrid A*
+    double hybrid_step_;
+    int    hybrid_num_steer_;
+    int    hybrid_heading_bins_;
+    double hybrid_max_steer_;
+    double hybrid_analytic_dist_;
+    double analytic_heading_tol_;
+    double analytic_cost_limit_;
+    double obstacle_cost_weight_;
+    double steer_penalty_;
+    double h_weight_;
+    int    spin_recovery_threshold_;
 
     double goal_x_, goal_y_;
 
@@ -471,11 +623,26 @@ private:
     double stuck_check_x_, stuck_check_y_;
     bool   in_recovery_;
     double recovery_start_;
-    bool   recovery_target_valid_;
-    double recovery_target_x_, recovery_target_y_;
+    // Trail: reversed breadcrumb waypoints to follow sequentially
+    std::vector<std::pair<double,double>> recovery_trail_;
+    int    recovery_trail_idx_;
     int    recovery_count_;
     int    plan_fail_count_;
     int    blend_ticks_;
+
+    // Breadcrumb trail persistence
+    struct BcEntry { double x, y; bool bad; };
+    std::vector<BcEntry> bc_log_;
+    bool   repeat_breadcrumb_;
+    int    world_idx_;
+    std::vector<std::pair<double,double>> loaded_good_trail_;
+    std::vector<std::pair<double,double>> loaded_bad_bcs_;
+    bool   using_loaded_trail_;
+    int    loaded_trail_idx_;
+
+    // Collision check visualization: projected footprint poses (odom frame)
+    struct FpPose { double x, y, th; bool collided; };
+    std::vector<FpPose> collision_viz_;
 
     // Progress deadlock
     bool   progress_time_init_;
@@ -486,128 +653,34 @@ private:
     int    escape_phase_;
 
     // TF
-    tf::TransformListener tf_listener_;
+    tf::TransformListener  tf_listener_;
+    tf::TransformBroadcaster map_tf_pub_;
+    double map_origin_x_, map_origin_y_, spawn_yaw_;
     bool   laser_tf_valid_;
     double laser_tx_, laser_ty_, laser_yaw_;
 
     // Grid
     double local_size_;
     int    grid_cells_;
-    struct KernelEntry { int di, dj; double cost; };
-    std::vector<KernelEntry> kernel_;
 
-    // Cached grid for controller cost queries
-    std::vector<float> cached_grid_;
-    double cached_ox_, cached_oy_;
-    bool   cached_grid_valid_ = false;
+
+    // Reusable Hybrid A* buffers (avoid repeated alloc/free)
+    std::vector<float> ha_gs_, ha_node_x_, ha_node_y_, ha_node_th_;
+    std::vector<int>   ha_came_from_;
+    std::vector<bool>  ha_closed_;
+    int                ha_buf_size_ = 0;
 
     // Pub/Sub
     ros::Publisher  cmd_pub_;
     ros::Publisher  path_pub_;
     ros::Publisher  costmap_pub_;
-    ros::Publisher  ctrl_costmap_pub_;
-    ros::Publisher  steer_samples_pub_;
+    ros::Publisher  marker_pub_;
     ros::Subscriber scan_sub_;
 
     // Logger
     std::ofstream log_file_;
 
     // -----------------------------------------------------------------------
-    // Kernel
-    // -----------------------------------------------------------------------
-    void buildKernel() {
-        double ir = inflation_radius_;  // hard wall for A*
-        double cr = cost_radius_;       // soft gradient for controller
-        int rc = std::min(static_cast<int>(std::ceil(cr / grid_res_)), 16);
-        kernel_.clear();
-        for (int di = -rc; di <= rc; ++di) {
-            for (int dj = -rc; dj <= rc; ++dj) {
-                double d = std::hypot(di, dj) * grid_res_;
-                if (d <= ir) {
-                    // Inside inflation radius: impassable for A*
-                    kernel_.push_back({di, dj, OCCUPIED});
-                } else if (d <= cr) {
-                    // Between inflation and cost radius: exponential falloff for controller
-                    double t = (d - ir) / (cr - ir);  // 0 at inflation edge, 1 at cost edge
-                    double cost = 0.95 * std::exp(-7.0 * t);
-                    kernel_.push_back({di, dj, cost});
-                }
-            }
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // Costmap-based clearance steering
-    // -----------------------------------------------------------------------
-    // Sample grid cost at a world point; returns 0 if out of bounds or no grid
-    float sampleCost(double wx, double wy) const {
-        if (!cached_grid_valid_) return 0.0f;
-        int n = grid_cells_;
-        int gi = static_cast<int>((wx - cached_ox_) / grid_res_);
-        int gj = static_cast<int>((wy - cached_oy_) / grid_res_);
-        if (gi < 0 || gi >= n || gj < 0 || gj >= n) return 0.0f;
-        return cached_grid_[gi * n + gj];
-    }
-
-    // Returns angular bias: positive = steer left, negative = steer right
-    // Samples 32 points in an 8x4 grid (8 lookahead distances x 4 lateral offsets per side)
-    // Also publishes sample points as a Path msg for rviz visualization
-    double costmapSteerBias() {
-        if (!cached_grid_valid_) return 0.0;
-        double left_cost = 0.0, right_cost = 0.0;
-        double cy = std::cos(robot_yaw_), sy = std::sin(robot_yaw_);
-
-        // 8 lookahead distances, 4 lateral offsets = 32 sample pairs (64 points total)
-        static constexpr int N_FWD = 8;
-        static constexpr int N_LAT = 4;
-        static constexpr double fwd_min = 0.1, fwd_max = 0.8;
-        static constexpr double lat_min = 0.10, lat_max = 0.30;
-
-        nav_msgs::Path viz;
-        viz.header.stamp = ros::Time::now();
-        viz.header.frame_id = "odom";
-        std::vector<geometry_msgs::PoseStamped> left_pts, right_pts;
-
-        for (int fi = 0; fi < N_FWD; ++fi) {
-            double fwd = fwd_min + (fwd_max - fwd_min) * fi / (N_FWD - 1);
-            for (int li = 0; li < N_LAT; ++li) {
-                double lat = lat_min + (lat_max - lat_min) * li / (N_LAT - 1);
-
-                // Left sample
-                double lx = robot_x_ + fwd * cy - lat * sy;
-                double ly = robot_y_ + fwd * sy + lat * cy;
-                float lc = sampleCost(lx, ly);
-                left_cost += lc;
-
-                // Right sample
-                double rx = robot_x_ + fwd * cy + lat * sy;
-                double ry = robot_y_ + fwd * sy - lat * cy;
-                float rc = sampleCost(rx, ry);
-                right_cost += rc;
-
-                // Collect left/right separately to avoid zig-zag in Path viz
-                geometry_msgs::PoseStamped ps;
-                ps.header = viz.header;
-                ps.pose.orientation.w = 1.0;
-                ps.pose.position.x = lx;
-                ps.pose.position.y = ly;
-                ps.pose.position.z = lc;
-                left_pts.push_back(ps);
-                ps.pose.position.x = rx;
-                ps.pose.position.y = ry;
-                ps.pose.position.z = rc;
-                right_pts.push_back(ps);
-            }
-        }
-
-        viz.poses.insert(viz.poses.end(), left_pts.begin(), left_pts.end());
-        viz.poses.insert(viz.poses.end(), right_pts.begin(), right_pts.end());
-        steer_samples_pub_.publish(viz);
-
-        // Steer away from the higher-cost side
-        return (right_cost - left_cost);  // positive → steer left
-    }
-
     // -----------------------------------------------------------------------
     // Sensor
     // -----------------------------------------------------------------------
@@ -787,27 +860,89 @@ private:
         }
         if (obs_cells.empty()) return grid;
 
-        // De-duplicate obstacle cells using a flat bool array
-        std::vector<bool> seen(n * n, false);
-        std::vector<OCell> unique_obs;
-        unique_obs.reserve(obs_cells.size());
-        for (auto& c : obs_cells) {
-            int key = c.i * n + c.j;
-            if (!seen[key]) {
-                seen[key] = true;
-                unique_obs.push_back(c);
+        // Multi-source BFS distance transform with true Euclidean distance.
+        // Each cell tracks (nearest_obs_i, nearest_obs_j) and computes exact distance.
+        {
+            int max_r = static_cast<int>(std::ceil(cost_radius_ / grid_res_));
+            float max_dist = static_cast<float>(max_r) * static_cast<float>(grid_res_);
+
+            // For each cell: nearest obstacle grid coords (-1 = unvisited)
+            std::vector<int16_t> near_i(n * n, -1);
+            std::vector<int16_t> near_j(n * n, -1);
+
+            std::vector<bool> seen(n * n, false);
+            std::queue<int> bfs;
+            for (auto& c : obs_cells) {
+                int idx = c.i * n + c.j;
+                if (!seen[idx]) {
+                    seen[idx] = true;
+                    near_i[idx] = static_cast<int16_t>(c.i);
+                    near_j[idx] = static_cast<int16_t>(c.j);
+                    bfs.push(idx);
+                }
+            }
+
+            static const int DI8[8] = {-1, 1, 0, 0, -1, -1, 1, 1};
+            static const int DJ8[8] = {0, 0, -1, 1, -1, 1, -1, 1};
+            while (!bfs.empty()) {
+                int idx = bfs.front(); bfs.pop();
+                int ci = idx / n, cj = idx % n;
+                int oi = near_i[idx], oj = near_j[idx];
+                for (int d = 0; d < 8; ++d) {
+                    int ni = ci + DI8[d], nj = cj + DJ8[d];
+                    if (ni < 0 || ni >= n || nj < 0 || nj >= n) continue;
+                    int nidx = ni * n + nj;
+                    if (near_i[nidx] >= 0) continue;  // already assigned
+                    // Check if within max radius (Manhattan pre-filter)
+                    if (std::abs(ni - oi) + std::abs(nj - oj) > max_r * 2) continue;
+                    // True Euclidean distance from this cell to nearest obstacle
+                    double ed = std::hypot(ni - oi, nj - oj) * grid_res_;
+                    if (ed > max_dist) continue;
+                    near_i[nidx] = static_cast<int16_t>(oi);
+                    near_j[nidx] = static_cast<int16_t>(oj);
+                    bfs.push(nidx);
+                }
+            }
+
+            // Apply cost from distance field
+            double ir = inflation_radius_;
+            double cr = cost_radius_;
+            for (int k = 0; k < n * n; ++k) {
+                if (near_i[k] < 0) continue;  // no obstacle nearby
+                int ci = k / n, cj = k % n;
+                if (ci == near_i[k] && cj == near_j[k]) continue;  // obstacle cell itself
+                double d = std::hypot(ci - near_i[k], cj - near_j[k]) * grid_res_;
+                float cost;
+                if (d <= ir) {
+                    cost = static_cast<float>(OCCUPIED);
+                } else if (d <= cr) {
+                    double t = (d - ir) / (cr - ir);
+                    cost = static_cast<float>(0.95 * (1.0 - t));
+                } else {
+                    continue;
+                }
+                if (cost > grid[k]) grid[k] = cost;
             }
         }
 
-        // Inflate using kernel
-        for (auto& oc : unique_obs) {
-            for (auto& ke : kernel_) {
-                int ni = oc.i + ke.di;
-                int nj = oc.j + ke.dj;
-                if (ni >= 0 && ni < n && nj >= 0 && nj < n) {
-                    int idx = ni * n + nj;
-                    if (ke.cost > grid[idx]) {
-                        grid[idx] = static_cast<float>(ke.cost);
+        // Inflate bad breadcrumbs from loaded trail
+        if (repeat_breadcrumb_ && !loaded_bad_bcs_.empty()) {
+            int bad_r = static_cast<int>(cost_radius_ / grid_res_);
+            for (auto& bc : loaded_bad_bcs_) {
+                int ci = static_cast<int>((bc.first - ox) / grid_res_);
+                int cj = static_cast<int>((bc.second - oy) / grid_res_);
+                for (int di = -bad_r; di <= bad_r; ++di) {
+                    for (int dj = -bad_r; dj <= bad_r; ++dj) {
+                        int ni = ci + di, nj = cj + dj;
+                        if (ni >= 0 && ni < n && nj >= 0 && nj < n) {
+                            double dist = std::hypot(di, dj) * grid_res_;
+                            if (dist <= cost_radius_) {
+                                float cost = static_cast<float>(
+                                    OCCUPIED * std::max(0.0, 1.0 - dist / cost_radius_));
+                                int idx = ni * n + nj;
+                                if (cost > grid[idx]) grid[idx] = cost;
+                            }
+                        }
                     }
                 }
             }
@@ -817,98 +952,235 @@ private:
     }
 
     // -----------------------------------------------------------------------
-    // A*
+    // Hybrid A*  — searches in (x, y, θ) continuous space
     // -----------------------------------------------------------------------
-    struct AStarNode {
+    struct HybridNode {
         double f;
-        int i, j;
-        bool operator>(const AStarNode& o) const { return f > o.f; }
+        int idx;  // flat index into (i, j, k) grid
+        bool operator>(const HybridNode& o) const { return f > o.f; }
     };
 
-    std::vector<std::pair<int,int>> astar(const std::vector<float>& grid,
-                                           int si, int sj, int gi, int gj) {
+    // Check if an arc from (x,y,θ) with curvature κ for length step is collision-free.
+    // Samples the arc at sub-step resolution and checks the costmap.
+    // Returns accumulated grid cost along the arc (0 = fully free).
+    double arcCost(const std::vector<float>& grid, double ox, double oy,
+                   int n, double x, double y, double th, double kappa, double step,
+                   double& out_x, double& out_y, double& out_th) const {
+        int nsub = std::max(3, static_cast<int>(std::ceil(step / (grid_res_ * 0.7))));
+        double ds = step / nsub;
+        double acc_cost = 0.0;
+        double cx = x, cy = y, cth = th;
+        for (int s = 0; s < nsub; ++s) {
+            cth += kappa * ds;
+            cx += std::cos(cth) * ds;
+            cy += std::sin(cth) * ds;
+            int gi = static_cast<int>((cx - ox) / grid_res_);
+            int gj = static_cast<int>((cy - oy) / grid_res_);
+            if (gi < 0 || gi >= n || gj < 0 || gj >= n) return -1.0;
+            float cell = grid[gi * n + gj];
+            if (cell >= static_cast<float>(OCCUPIED)) return -1.0;
+            acc_cost += static_cast<double>(cell);
+        }
+        out_x = cx; out_y = cy; out_th = normalizeAngle(cth);
+        return acc_cost / nsub;  // average cost
+    }
+
+    // Try straight-line analytic expansion from (x,y) to (gx,gy) at heading th.
+    // Returns true if the line is collision-free and heading-aligned enough.
+    bool analyticExpand(const std::vector<float>& grid, double ox, double oy, int n,
+                        double x, double y, double th, double gx, double gy,
+                        std::vector<std::pair<double,double>>& seg) const {
+        double dx = gx - x, dy = gy - y;
+        double dist = std::hypot(dx, dy);
+        if (dist < 0.05) { seg.push_back({gx, gy}); return true; }
+        double target_th = std::atan2(dy, dx);
+        if (std::fabs(normalizeAngle(target_th - th)) > analytic_heading_tol_) return false;
+
+        int nsteps = std::max(3, static_cast<int>(std::ceil(dist / (grid_res_ * 0.7))));
+        for (int s = 1; s <= nsteps; ++s) {
+            double f = static_cast<double>(s) / nsteps;
+            double px = x + dx * f, py = y + dy * f;
+            int gi = static_cast<int>((px - ox) / grid_res_);
+            int gj = static_cast<int>((py - oy) / grid_res_);
+            if (gi < 0 || gi >= n || gj < 0 || gj >= n) return false;
+            if (grid[gi * n + gj] >= static_cast<float>(analytic_cost_limit_)) return false;
+            seg.push_back({px, py});
+        }
+        return true;
+    }
+
+    std::vector<std::pair<double,double>> hybridAstar(
+        const std::vector<float>& grid, double ox, double oy,
+        double sx, double sy, double sth,
+        double gx, double gy)
+    {
         int n = grid_cells_;
+        int nbins = hybrid_heading_bins_;
+        double bin_size = 2.0 * M_PI / nbins;
+        int nsteer = hybrid_num_steer_;
+        double step = hybrid_step_;
+        double max_kappa = hybrid_max_steer_;
+
+        // Ensure start is in free space
+        {
+            int si = static_cast<int>((sx - ox) / grid_res_);
+            int sj = static_cast<int>((sy - oy) / grid_res_);
+            if (si < 0 || si >= n || sj < 0 || sj >= n) return {};
+            if (grid[si * n + sj] >= static_cast<float>(OCCUPIED)) {
+                auto f = nearestFree(grid, si, sj, n);
+                if (f.first < 0) return {};
+                sx = ox + (f.first + 0.5) * grid_res_;
+                sy = oy + (f.second + 0.5) * grid_res_;
+            }
+        }
+
+        // 3D index: (i, j, k) → flat
+        auto toIdx = [&](int i, int j, int k) -> int {
+            return (i * n + j) * nbins + k;
+        };
+        auto thetaBin = [&](double th) -> int {
+            double a = normalizeAngle(th);
+            if (a < 0) a += 2.0 * M_PI;
+            int k = static_cast<int>(a / bin_size) % nbins;
+            return k;
+        };
+
+        int total = n * n * nbins;
+        if (total > ha_buf_size_) {
+            ha_gs_.resize(total);
+            ha_came_from_.resize(total);
+            ha_node_x_.resize(total);
+            ha_node_y_.resize(total);
+            ha_node_th_.resize(total);
+            ha_closed_.resize(total);
+            ha_buf_size_ = total;
+        }
+        std::fill(ha_gs_.begin(), ha_gs_.begin() + total, std::numeric_limits<float>::infinity());
+        std::fill(ha_came_from_.begin(), ha_came_from_.begin() + total, -1);
+        std::fill(ha_node_x_.begin(), ha_node_x_.begin() + total, 0.0f);
+        std::fill(ha_node_y_.begin(), ha_node_y_.begin() + total, 0.0f);
+        std::fill(ha_node_th_.begin(), ha_node_th_.begin() + total, 0.0f);
+        std::fill(ha_closed_.begin(), ha_closed_.begin() + total, false);
+        auto& gs = ha_gs_;
+        auto& came_from = ha_came_from_;
+        auto& node_x = ha_node_x_;
+        auto& node_y = ha_node_y_;
+        auto& node_th = ha_node_th_;
+        auto& closed = ha_closed_;
+
+        int sk = thetaBin(sth);
+        int si = static_cast<int>((sx - ox) / grid_res_);
+        int sj = static_cast<int>((sy - oy) / grid_res_);
         si = std::max(0, std::min(n - 1, si));
         sj = std::max(0, std::min(n - 1, sj));
-        gi = std::max(0, std::min(n - 1, gi));
-        gj = std::max(0, std::min(n - 1, gj));
+        int sidx = toIdx(si, sj, sk);
+        gs[sidx] = 0.0f;
+        node_x[sidx] = static_cast<float>(sx);
+        node_y[sidx] = static_cast<float>(sy);
+        node_th[sidx] = static_cast<float>(sth);
 
-        // If start/goal occupied, find nearest free
-        if (grid[si * n + sj] >= OCCUPIED) {
-            auto f = nearestFree(grid, si, sj, n);
-            if (f.first < 0) return {};
-            si = f.first; sj = f.second;
+        std::priority_queue<HybridNode, std::vector<HybridNode>, std::greater<HybridNode>> heap;
+        heap.push({std::hypot(gx - sx, gy - sy), sidx});
+
+        // Precompute steering curvatures
+        std::vector<double> kappas(nsteer);
+        for (int s = 0; s < nsteer; ++s) {
+            kappas[s] = -max_kappa + 2.0 * max_kappa * s / std::max(1, nsteer - 1);
         }
-        if (grid[gi * n + gj] >= OCCUPIED) {
-            auto f = nearestFree(grid, gi, gj, n);
-            if (f.first < 0) return {};
-            gi = f.first; gj = f.second;
-        }
 
-        static const int DI[8] = {-1, 1, 0, 0, -1, -1, 1, 1};
-        static const int DJ[8] = {0, 0, -1, 1, -1, 1, -1, 1};
-        static const double SC[8] = {1.0, 1.0, 1.0, 1.0, 1.414, 1.414, 1.414, 1.414};
-        static const double TURN_PEN = 0.25;
-
-        std::vector<float> gs(n * n, std::numeric_limits<float>::infinity());
-        std::vector<int> came_from(n * n, -1);  // flat index of parent, -1 = none
-        // Encode direction as (di+1)*3+(dj+1), range 0..8; 9 = no direction
-        std::vector<uint8_t> cdir(n * n, 9);
-        std::vector<bool> closed(n * n, false);
-
-        gs[si * n + sj] = 0.0f;
-        std::priority_queue<AStarNode, std::vector<AStarNode>, std::greater<AStarNode>> heap;
-        heap.push({0.0, si, sj});
+        int goal_idx = -1;  // set when we reach the goal
+        // Analytic expansion storage: if analytic succeeds, store the segment here
+        std::vector<std::pair<double,double>> analytic_seg;
+        int analytic_parent = -1;
 
         int iterations = 0;
-        while (!heap.empty() && iterations < 150000) {
+        while (!heap.empty() && iterations < 200000) {
             ++iterations;
-            AStarNode cur = heap.top();
+            HybridNode cur = heap.top();
             heap.pop();
-            int ci = cur.i, cj = cur.j;
-            int cidx = ci * n + cj;
+            int cidx = cur.idx;
             if (closed[cidx]) continue;
             closed[cidx] = true;
 
-            if (ci == gi && cj == gj) {
-                // Reconstruct path
-                std::vector<std::pair<int,int>> path;
-                int idx = ci * n + cj;
-                path.push_back({ci, cj});
-                while (came_from[idx] >= 0) {
-                    idx = came_from[idx];
-                    path.push_back({idx / n, idx % n});
-                }
-                std::reverse(path.begin(), path.end());
-                return path;
+            double cx = static_cast<double>(node_x[cidx]);
+            double cy = static_cast<double>(node_y[cidx]);
+            double cth = static_cast<double>(node_th[cidx]);
+
+            double d2g = std::hypot(gx - cx, gy - cy);
+
+            // Goal check: within one step
+            if (d2g < step * 1.2) {
+                goal_idx = cidx;
+                break;
             }
 
-            uint8_t pd = cdir[cidx];
-            for (int d = 0; d < 8; ++d) {
-                int ni = ci + DI[d];
-                int nj = cj + DJ[d];
-                if (ni < 0 || ni >= n || nj < 0 || nj >= n) continue;
-                int nidx = ni * n + nj;
-                if (closed[nidx]) continue;
-                float cc = grid[nidx];
-                if (cc >= OCCUPIED) continue;
-
-                float tg = gs[cidx] + static_cast<float>(SC[d]) * (1.0f + 4.0f * cc);
-                // Direction-change penalty
-                uint8_t nd = static_cast<uint8_t>((DI[d] + 1) * 3 + (DJ[d] + 1));
-                if (pd != 9 && nd != pd) {
-                    tg += static_cast<float>(TURN_PEN);
+            // Analytic expansion: try straight-line when close
+            if (d2g < hybrid_analytic_dist_) {
+                analytic_seg.clear();
+                if (analyticExpand(grid, ox, oy, n, cx, cy, cth, gx, gy, analytic_seg)) {
+                    analytic_parent = cidx;
+                    goal_idx = cidx;
+                    break;
                 }
+            }
+
+            // Expand: try each steering angle
+            for (int s = 0; s < nsteer; ++s) {
+                double kappa = kappas[s];
+                double nx, ny, nth;
+                double arc_c = arcCost(grid, ox, oy, n, cx, cy, cth, kappa, step, nx, ny, nth);
+                if (arc_c < 0.0) continue;  // collision
+
+                int ni = static_cast<int>((nx - ox) / grid_res_);
+                int nj = static_cast<int>((ny - oy) / grid_res_);
+                int nk = thetaBin(nth);
+                if (ni < 0 || ni >= n || nj < 0 || nj >= n) continue;
+                int nidx = toIdx(ni, nj, nk);
+
+                float tg = gs[cidx] + static_cast<float>(step * (1.0 + obstacle_cost_weight_ * arc_c));
+                // Penalize steering
+                tg += static_cast<float>(steer_penalty_ * std::fabs(kappa) / max_kappa);
+
                 if (tg < gs[nidx]) {
                     gs[nidx] = tg;
-                    double h = std::hypot(ni - gi, nj - gj);
-                    heap.push({tg + h, ni, nj});
+                    double h = std::hypot(gx - nx, gy - ny);
+                    heap.push({static_cast<double>(tg) + h * h_weight_, nidx});
                     came_from[nidx] = cidx;
-                    cdir[nidx] = nd;
+                    node_x[nidx] = static_cast<float>(nx);
+                    node_y[nidx] = static_cast<float>(ny);
+                    node_th[nidx] = static_cast<float>(nth);
                 }
             }
         }
-        return {};
+
+        if (goal_idx < 0) return {};  // no path found
+
+        // Reconstruct: walk back from goal_idx
+        std::vector<std::pair<double,double>> path;
+        // If analytic expansion succeeded, prepend the analytic segment
+        if (analytic_parent >= 0 && !analytic_seg.empty()) {
+            // First reconstruct from analytic_parent back to start
+            int idx = analytic_parent;
+            while (idx >= 0) {
+                path.push_back({static_cast<double>(node_x[idx]),
+                                static_cast<double>(node_y[idx])});
+                idx = came_from[idx];
+            }
+            std::reverse(path.begin(), path.end());
+            // Append analytic segment
+            for (auto& p : analytic_seg) path.push_back(p);
+        } else {
+            int idx = goal_idx;
+            while (idx >= 0) {
+                path.push_back({static_cast<double>(node_x[idx]),
+                                static_cast<double>(node_y[idx])});
+                idx = came_from[idx];
+            }
+            std::reverse(path.begin(), path.end());
+        }
+
+        ROS_INFO_THROTTLE(5.0, "Hybrid A*: %d iterations, %zu waypoints", iterations, path.size());
+        return path;
     }
 
     std::pair<int,int> nearestFree(const std::vector<float>& grid, int ci, int cj, int n) {
@@ -928,44 +1200,8 @@ private:
         return {-1, -1};
     }
 
-    void publishCostmap(const std::vector<float>& grid, const Eigen::MatrixXd& obstacles, double ox, double oy) {
-        if (costmap_pub_.getNumSubscribers() == 0) return;
+    void publishCostmap(const std::vector<float>& grid, const Eigen::MatrixXd& /*obstacles*/, double ox, double oy) {
         int n = grid_cells_;
-        double cr = cost_radius_;
-        int kr = std::min(static_cast<int>(std::ceil(cr / grid_res_)), 8);
-
-        // Build smooth exponential costmap for visualization (no hard inflation step)
-        std::vector<float> smooth(n * n, 0.0f);
-        if (obstacles.rows() > 0) {
-            std::vector<bool> seen(n * n, false);
-            std::vector<std::pair<int,int>> obs_cells;
-            for (int k = 0; k < static_cast<int>(obstacles.rows()); ++k) {
-                int gi = static_cast<int>((obstacles(k, 0) - ox) / grid_res_);
-                int gj = static_cast<int>((obstacles(k, 1) - oy) / grid_res_);
-                if (gi >= 0 && gi < n && gj >= 0 && gj < n) {
-                    int idx = gi * n + gj;
-                    if (!seen[idx]) {
-                        seen[idx] = true;
-                        smooth[idx] = 1.0f;
-                        obs_cells.push_back({gi, gj});
-                    }
-                }
-            }
-            for (auto& oc : obs_cells) {
-                for (int di = -kr; di <= kr; ++di) {
-                    for (int dj = -kr; dj <= kr; ++dj) {
-                        int ni = oc.first + di;
-                        int nj = oc.second + dj;
-                        if (ni < 0 || ni >= n || nj < 0 || nj >= n) continue;
-                        double d = std::hypot(di, dj) * grid_res_;
-                        if (d < 1e-6 || d > cr) continue;
-                        float cost = static_cast<float>(std::exp(-3.0 * d / cr));
-                        int idx = ni * n + nj;
-                        if (cost > smooth[idx]) smooth[idx] = cost;
-                    }
-                }
-            }
-        }
 
         nav_msgs::OccupancyGrid msg;
         msg.header.stamp = ros::Time::now();
@@ -979,7 +1215,7 @@ private:
         msg.data.resize(n * n);
         for (int xi = 0; xi < n; ++xi) {
             for (int yi = 0; yi < n; ++yi) {
-                float v = smooth[xi * n + yi];
+                float v = grid[xi * n + yi];
                 int ros_idx = yi * n + xi;
                 msg.data[ros_idx] = (v <= 0.0f) ? 0 : static_cast<int8_t>(std::min(100.0f, v * 100.0f));
             }
@@ -987,68 +1223,6 @@ private:
         costmap_pub_.publish(msg);
     }
 
-    // Publish cost-only grid (no inflation wall) — shows what the controller sees
-    void publishCtrlCostmap(const Eigen::MatrixXd& obstacles, double ox, double oy) {
-        if (ctrl_costmap_pub_.getNumSubscribers() == 0) return;
-        int n = grid_cells_;
-        double cr = cost_radius_;
-        int kr = std::min(static_cast<int>(std::ceil(cr / grid_res_)), 8);
-
-        // Build cost-only grid: smooth falloff from obstacle, no hard wall
-        std::vector<float> cgrid(n * n, 0.0f);
-
-        if (obstacles.rows() > 0) {
-            // Collect unique obstacle cells
-            std::vector<bool> seen(n * n, false);
-            std::vector<std::pair<int,int>> obs_cells;
-            for (int k = 0; k < static_cast<int>(obstacles.rows()); ++k) {
-                int gi = static_cast<int>((obstacles(k, 0) - ox) / grid_res_);
-                int gj = static_cast<int>((obstacles(k, 1) - oy) / grid_res_);
-                if (gi >= 0 && gi < n && gj >= 0 && gj < n) {
-                    int idx = gi * n + gj;
-                    if (!seen[idx]) {
-                        seen[idx] = true;
-                        cgrid[idx] = 1.0f;
-                        obs_cells.push_back({gi, gj});
-                    }
-                }
-            }
-            // Apply cost-only kernel (pure exponential, no inflation)
-            for (auto& oc : obs_cells) {
-                for (int di = -kr; di <= kr; ++di) {
-                    for (int dj = -kr; dj <= kr; ++dj) {
-                        int ni = oc.first + di;
-                        int nj = oc.second + dj;
-                        if (ni < 0 || ni >= n || nj < 0 || nj >= n) continue;
-                        double d = std::hypot(di, dj) * grid_res_;
-                        if (d < 1e-6 || d > cr) continue;
-                        float cost = static_cast<float>(std::exp(-3.0 * d / cr));
-                        int idx = ni * n + nj;
-                        if (cost > cgrid[idx]) cgrid[idx] = cost;
-                    }
-                }
-            }
-        }
-
-        nav_msgs::OccupancyGrid msg;
-        msg.header.stamp = ros::Time::now();
-        msg.header.frame_id = "odom";
-        msg.info.resolution = static_cast<float>(grid_res_);
-        msg.info.width  = n;
-        msg.info.height = n;
-        msg.info.origin.position.x = ox;
-        msg.info.origin.position.y = oy;
-        msg.info.origin.orientation.w = 1.0;
-        msg.data.resize(n * n);
-        for (int xi = 0; xi < n; ++xi) {
-            for (int yi = 0; yi < n; ++yi) {
-                float v = cgrid[xi * n + yi];
-                int ros_idx = yi * n + xi;
-                msg.data[ros_idx] = (v <= 0.0f) ? 0 : static_cast<int8_t>(std::min(100.0f, v * 100.0f));
-            }
-        }
-        ctrl_costmap_pub_.publish(msg);
-    }
 
     // -----------------------------------------------------------------------
     // Planning
@@ -1058,162 +1232,65 @@ private:
         double ox, oy;
         std::vector<float> grid = buildGrid(obstacles, ox, oy);
         publishCostmap(grid, obstacles, ox, oy);
-        publishCtrlCostmap(obstacles, ox, oy);
-        cached_grid_ = grid;
-        cached_ox_ = ox;
-        cached_oy_ = oy;
-        cached_grid_valid_ = true;
-        int n = grid_cells_;
-
-        double si_d = (robot_x_ - ox) / grid_res_;
-        double sj_d = (robot_y_ - oy) / grid_res_;
 
         double dx = goal_x_ - robot_x_;
         double dy = goal_y_ - robot_y_;
         double dist = std::hypot(dx, dy);
         if (dist < 0.1) return false;
 
+        // Compute planning target (clamped to grid)
         double la = std::min(dist, local_size_ * 0.48);
         double target_x = robot_x_ + (dx / dist) * la;
         double target_y = robot_y_ + (dy / dist) * la;
-        double gi_d = std::max(0.0, std::min(static_cast<double>(n - 1), (target_x - ox) / grid_res_));
-        double gj_d = std::max(0.0, std::min(static_cast<double>(n - 1), (target_y - oy) / grid_res_));
 
-        auto gp = astar(grid, static_cast<int>(si_d), static_cast<int>(sj_d),
-                         static_cast<int>(gi_d), static_cast<int>(gj_d));
-        if (gp.empty()) {
-            ROS_WARN_THROTTLE(2.0, "A*: no path");
+        auto wp = hybridAstar(grid, ox, oy,
+                              robot_x_, robot_y_, robot_yaw_,
+                              target_x, target_y);
+        if (wp.empty()) {
+            ROS_WARN_THROTTLE(2.0, "Hybrid A*: no path");
             return false;
         }
 
-        // Convert grid cells to odom coordinates
-        std::vector<std::pair<double,double>> wp;
-        wp.reserve(gp.size());
-        for (auto& c : gp) {
-            wp.push_back({ox + c.first * grid_res_, oy + c.second * grid_res_});
-        }
-
-        // [F1] Smooth
-        auto sm = smooth(wp, grid, ox, oy);
-        path_ = sm;
+        // Light resample: Hybrid A* output is already smooth arcs,
+        // just ensure uniform waypoint spacing for the controller
+        path_ = resamplePath(wp, 0.15);
         path_idx_ = 0;
         advanceIdx();
         pubPath();
         return true;
     }
 
-    std::vector<std::pair<double,double>> smooth(
-        const std::vector<std::pair<double,double>>& wp,
-        const std::vector<float>& grid, double ox, double oy)
+    // Uniform resample: interpolate waypoints at fixed spacing
+    std::vector<std::pair<double,double>> resamplePath(
+        const std::vector<std::pair<double,double>>& wp, double spacing)
     {
-        if (wp.size() <= 2) return wp;
-        int n = grid_cells_;
-
-        // Shortcut pass
-        std::vector<std::pair<double,double>> sc;
-        sc.push_back(wp[0]);
-        int i = 0;
-        while (i < static_cast<int>(wp.size()) - 1) {
-            int bj = i + 1;
-            for (int j = static_cast<int>(wp.size()) - 1; j > i + 1; --j) {
-                if (lineClear(wp[i], wp[j], grid, ox, oy, n)) {
-                    bj = j;
-                    break;
-                }
-            }
-            sc.push_back(wp[bj]);
-            i = bj;
-        }
-
-        if (sc.size() <= 2) return sc;
-
-        // Resample at uniform spacing
-        double spacing = 0.12;
-        std::vector<std::pair<double,double>> rs;
-        rs.push_back(sc[0]);
-        double ac = 0.0;
-        for (int i = 1; i < static_cast<int>(sc.size()); ++i) {
-            double ddx = sc[i].first - sc[i - 1].first;
-            double ddy = sc[i].second - sc[i - 1].second;
+        if (wp.size() <= 1) return wp;
+        std::vector<std::pair<double,double>> out;
+        out.push_back(wp[0]);
+        double acc = 0.0;
+        for (int i = 1; i < static_cast<int>(wp.size()); ++i) {
+            double ddx = wp[i].first - wp[i - 1].first;
+            double ddy = wp[i].second - wp[i - 1].second;
             double seg = std::hypot(ddx, ddy);
             if (seg < 1e-6) continue;
-            ac += seg;
-            while (ac >= spacing) {
-                ac -= spacing;
-                double f = 1.0 - ac / seg;
-                rs.push_back({sc[i - 1].first + ddx * f, sc[i - 1].second + ddy * f});
+            acc += seg;
+            while (acc >= spacing) {
+                acc -= spacing;
+                double f = 1.0 - acc / seg;
+                out.push_back({wp[i - 1].first + ddx * f, wp[i - 1].second + ddy * f});
             }
         }
-        if (rs.back() != sc.back()) {
-            rs.push_back(sc.back());
-        }
-        if (rs.size() <= 2) return sc;
-
-        // Gradient descent: smooth curvature while staying in free space
-        int np = static_cast<int>(rs.size());
-        std::vector<double> ptx(np), pty(np);
-        std::vector<double> origx(np), origy(np);
-        for (int k = 0; k < np; ++k) {
-            ptx[k] = origx[k] = rs[k].first;
-            pty[k] = origy[k] = rs[k].second;
-        }
-
-        double w_smooth = 0.25;
-        double w_data = 0.1;
-        for (int iter = 0; iter < 40; ++iter) {
-            for (int k = 1; k < np - 1; ++k) {
-                double mx = (ptx[k - 1] + ptx[k + 1]) / 2.0;
-                double my = (pty[k - 1] + pty[k + 1]) / 2.0;
-                double nx = ptx[k] + w_smooth * (mx - ptx[k]) + w_data * (origx[k] - ptx[k]);
-                double ny = pty[k] + w_smooth * (my - pty[k]) + w_data * (origy[k] - pty[k]);
-                int gi = static_cast<int>((nx - ox) / grid_res_);
-                int gj = static_cast<int>((ny - oy) / grid_res_);
-                if (gi >= 0 && gi < n && gj >= 0 && gj < n && grid[gi * n + gj] < 0.8f) {
-                    ptx[k] = nx;
-                    pty[k] = ny;
-                }
-            }
-        }
-
-        // Subsample to ~15 waypoints
-        int step = std::max(1, np / 15);
-        std::vector<std::pair<double,double>> result;
-        for (int k = 0; k < np; k += step) {
-            result.push_back({ptx[k], pty[k]});
-        }
-        if (result.back().first != ptx[np - 1] || result.back().second != pty[np - 1]) {
-            result.push_back({ptx[np - 1], pty[np - 1]});
-        }
-        return result;
-    }
-
-    bool lineClear(const std::pair<double,double>& p1,
-                   const std::pair<double,double>& p2,
-                   const std::vector<float>& grid,
-                   double ox, double oy, int n) {
-        double ddx = p2.first - p1.first;
-        double ddy = p2.second - p1.second;
-        double dist = std::hypot(ddx, ddy);
-        if (dist < 0.01) return true;
-        int steps = static_cast<int>(dist / (grid_res_ * 0.5)) + 1;
-        for (int s = 0; s <= steps; ++s) {
-            double f = static_cast<double>(s) / std::max(1, steps);
-            int gi = static_cast<int>((p1.first + ddx * f - ox) / grid_res_);
-            int gj = static_cast<int>((p1.second + ddy * f - oy) / grid_res_);
-            if (gi >= 0 && gi < n && gj >= 0 && gj < n) {
-                if (grid[gi * n + gj] >= OCCUPIED) return false;
-            } else {
-                return false;
-            }
-        }
-        return true;
+        if (out.back() != wp.back()) out.push_back(wp.back());
+        return out;
     }
 
     void advanceIdx() {
         while (path_idx_ < static_cast<int>(path_.size()) - 1) {
             double ddx = path_[path_idx_].first - robot_x_;
             double ddy = path_[path_idx_].second - robot_y_;
-            if (std::hypot(ddx, ddy) < checkpoint_dist_) {
+            double ang_err = std::fabs(normalizeAngle(std::atan2(ddy, ddx) - robot_yaw_));
+            // Advance if close enough, or waypoint is clearly behind the robot (already passed)
+            if (std::hypot(ddx, ddy) < checkpoint_dist_ || ang_err > (M_PI * 5.0 / 6.0)) {
                 path_idx_++;
             } else {
                 break;
@@ -1221,7 +1298,195 @@ private:
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Debug markers for RViz
+    // -----------------------------------------------------------------------
+    void pubDebugMarkers(double tx, double ty, const std::string& branch, double ae) {
+        if (marker_pub_.getNumSubscribers() == 0) return;
+        visualization_msgs::MarkerArray ma;
+        ros::Time now = ros::Time::now();
+
+        // Helper: fill common marker fields
+        auto mk = [&](int id, int type) {
+            visualization_msgs::Marker m;
+            m.header.frame_id = "odom";
+            m.header.stamp = now;
+            m.ns = "astar_debug";
+            m.id = id;
+            m.type = type;
+            m.action = visualization_msgs::Marker::ADD;
+            m.pose.orientation.w = 1.0;
+            m.lifetime = ros::Duration(0.3);
+            return m;
+        };
+
+        double d2g = std::hypot(goal_x_ - robot_x_, goal_y_ - robot_y_);
+
+        // 0 — Goal: large red sphere (persistent so it doesn't flicker)
+        {
+            auto m = mk(0, visualization_msgs::Marker::SPHERE);
+            m.lifetime = ros::Duration(2.0);
+            m.pose.position.x = goal_x_;
+            m.pose.position.y = goal_y_;
+            m.scale.x = m.scale.y = m.scale.z = 0.5;
+            m.color.r = 1.0f; m.color.g = 0.0f; m.color.b = 0.0f; m.color.a = 1.0f;
+            ma.markers.push_back(m);
+        }
+
+        // 1 — Current waypoint target: yellow sphere
+        {
+            auto m = mk(1, visualization_msgs::Marker::SPHERE);
+            m.pose.position.x = tx;
+            m.pose.position.y = ty;
+            m.scale.x = m.scale.y = m.scale.z = 0.25;
+            m.color.r = 1.0f; m.color.g = 1.0f; m.color.b = 0.0f; m.color.a = 1.0f;
+            ma.markers.push_back(m);
+        }
+
+        // 2 — Arrow: robot → goal (cyan)
+        {
+            auto m = mk(2, visualization_msgs::Marker::ARROW);
+            geometry_msgs::Point p0, p1;
+            p0.x = robot_x_; p0.y = robot_y_; p0.z = 0.05;
+            p1.x = goal_x_;  p1.y = goal_y_;  p1.z = 0.05;
+            m.points.push_back(p0); m.points.push_back(p1);
+            m.scale.x = 0.04; m.scale.y = 0.10; m.scale.z = 0.0;
+            m.color.r = 0.0f; m.color.g = 1.0f; m.color.b = 1.0f; m.color.a = 0.8f;
+            ma.markers.push_back(m);
+        }
+
+        // 3 — Arrow: robot → waypoint target (green), only if different from goal
+        if (std::hypot(tx - goal_x_, ty - goal_y_) > 0.1) {
+            auto m = mk(3, visualization_msgs::Marker::ARROW);
+            geometry_msgs::Point p0, p1;
+            p0.x = robot_x_; p0.y = robot_y_; p0.z = 0.05;
+            p1.x = tx;       p1.y = ty;       p1.z = 0.05;
+            m.points.push_back(p0); m.points.push_back(p1);
+            m.scale.x = 0.04; m.scale.y = 0.10; m.scale.z = 0.0;
+            m.color.r = 0.0f; m.color.g = 1.0f; m.color.b = 0.0f; m.color.a = 1.0f;
+            ma.markers.push_back(m);
+        } else {
+            // Clear old waypoint arrow when pointing at goal
+            auto m = mk(3, visualization_msgs::Marker::DELETE);
+            ma.markers.push_back(m);
+        }
+
+        // 4 — Robot heading arrow (blue)
+        {
+            auto m = mk(4, visualization_msgs::Marker::ARROW);
+            geometry_msgs::Point p0, p1;
+            p0.x = robot_x_; p0.y = robot_y_; p0.z = 0.05;
+            p1.x = robot_x_ + 0.8 * std::cos(robot_yaw_);
+            p1.y = robot_y_ + 0.8 * std::sin(robot_yaw_);
+            p1.z = 0.05;
+            m.points.push_back(p0); m.points.push_back(p1);
+            m.scale.x = 0.05; m.scale.y = 0.12; m.scale.z = 0.0;
+            m.color.r = 0.2f; m.color.g = 0.4f; m.color.b = 1.0f; m.color.a = 1.0f;
+            ma.markers.push_back(m);
+        }
+
+        // 5 — Status text above robot
+        {
+            auto m = mk(5, visualization_msgs::Marker::TEXT_VIEW_FACING);
+            m.pose.position.x = robot_x_;
+            m.pose.position.y = robot_y_;
+            m.pose.position.z = 0.6;
+            m.scale.z = 0.25;
+            m.color.r = 1.0f; m.color.g = 1.0f; m.color.b = 1.0f; m.color.a = 1.0f;
+            char buf[128];
+            std::snprintf(buf, sizeof(buf), "%s\nd2g=%.2fm ae=%.0f°",
+                          branch.c_str(), d2g, ae * 180.0 / M_PI);
+            m.text = buf;
+            ma.markers.push_back(m);
+        }
+
+        // 6 — Breadcrumbs: small blue spheres
+        if (!breadcrumbs_.empty()) {
+            auto m = mk(6, visualization_msgs::Marker::SPHERE_LIST);
+            m.scale.x = m.scale.y = m.scale.z = 0.10;
+            m.color.r = 0.3f; m.color.g = 0.3f; m.color.b = 1.0f; m.color.a = 0.7f;
+            for (auto& bc : breadcrumbs_) {
+                geometry_msgs::Point p;
+                p.x = bc.first; p.y = bc.second; p.z = 0.02;
+                m.points.push_back(p);
+            }
+            ma.markers.push_back(m);
+        }
+
+        // 7 — Recovery trail: magenta spheres along the backtrack path
+        if (in_recovery_ && !recovery_trail_.empty()) {
+            auto m = mk(7, visualization_msgs::Marker::SPHERE_LIST);
+            m.scale.x = m.scale.y = m.scale.z = 0.15;
+            m.color.r = 1.0f; m.color.g = 0.0f; m.color.b = 1.0f; m.color.a = 0.8f;
+            for (int ri = recovery_trail_idx_; ri < static_cast<int>(recovery_trail_.size()); ++ri) {
+                geometry_msgs::Point p;
+                p.x = recovery_trail_[ri].first;
+                p.y = recovery_trail_[ri].second;
+                p.z = 0.08;
+                m.points.push_back(p);
+            }
+            ma.markers.push_back(m);
+        }
+
+        // 8 — Loaded good trail: blue squares
+        if (repeat_breadcrumb_ && !loaded_good_trail_.empty()) {
+            auto m = mk(8, visualization_msgs::Marker::CUBE_LIST);
+            m.scale.x = m.scale.y = 0.12; m.scale.z = 0.02;
+            m.color.r = 0.2f; m.color.g = 0.4f; m.color.b = 1.0f; m.color.a = 0.6f;
+            m.lifetime = ros::Duration(2.0);
+            for (auto& bc : loaded_good_trail_) {
+                geometry_msgs::Point p;
+                p.x = bc.first; p.y = bc.second; p.z = 0.01;
+                m.points.push_back(p);
+            }
+            ma.markers.push_back(m);
+        }
+
+        // 9 — Loaded bad breadcrumbs: red squares
+        if (repeat_breadcrumb_ && !loaded_bad_bcs_.empty()) {
+            auto m = mk(9, visualization_msgs::Marker::CUBE_LIST);
+            m.scale.x = m.scale.y = 0.12; m.scale.z = 0.02;
+            m.color.r = 1.0f; m.color.g = 0.2f; m.color.b = 0.2f; m.color.a = 0.5f;
+            m.lifetime = ros::Duration(2.0);
+            for (auto& bc : loaded_bad_bcs_) {
+                geometry_msgs::Point p;
+                p.x = bc.first; p.y = bc.second; p.z = 0.01;
+                m.points.push_back(p);
+            }
+            ma.markers.push_back(m);
+        }
+
+        // 10 — Collision check footprints: green (safe) / red (collision)
+        if (!collision_viz_.empty()) {
+            double hx = robot_length_ + 2.0 * proj_clearance_;
+            double hy = robot_width_  + 2.0 * proj_clearance_;
+            for (int ci = 0; ci < static_cast<int>(collision_viz_.size()); ++ci) {
+                auto& fp = collision_viz_[ci];
+                auto m = mk(100 + ci, visualization_msgs::Marker::CUBE);
+                m.pose.position.x = fp.x;
+                m.pose.position.y = fp.y;
+                m.pose.position.z = 0.02;
+                double hz = fp.th / 2.0;
+                m.pose.orientation.z = std::sin(hz);
+                m.pose.orientation.w = std::cos(hz);
+                m.scale.x = hx;
+                m.scale.y = hy;
+                m.scale.z = 0.02;
+                m.lifetime = ros::Duration(0.15);
+                if (fp.collided) {
+                    m.color.r = 1.0f; m.color.g = 0.0f; m.color.b = 0.0f; m.color.a = 0.5f;
+                } else {
+                    m.color.r = 0.0f; m.color.g = 1.0f; m.color.b = 0.0f; m.color.a = 0.25f;
+                }
+                ma.markers.push_back(m);
+            }
+        }
+
+        marker_pub_.publish(ma);
+    }
+
     void pubPath() {
+        if (path_pub_.getNumSubscribers() == 0) return;
         nav_msgs::Path msg;
         msg.header.frame_id = "odom";
         msg.header.stamp = ros::Time::now();
@@ -1242,10 +1507,11 @@ private:
     // -----------------------------------------------------------------------
     bool checkFwdCollision(double lv, double av, double& out_speed) {
         out_speed = lv;
+        collision_viz_.clear();
         if (!have_scan_ || scan_ranges_.size() == 0) return true;
 
         int n = static_cast<int>(scan_ranges_.size());
-        // Build valid obstacle points in base_link
+        // Build valid obstacle points in base_link frame
         std::vector<double> olx, oly;
         olx.reserve(n); oly.reserve(n);
         for (int i = 0; i < n; ++i) {
@@ -1258,7 +1524,12 @@ private:
         if (olx.empty()) return true;
 
         int nobs = static_cast<int>(olx.size());
-        double eff_radius = (std::fabs(av) > 0.5) ? robot_radius_ : control_radius_;
+        // Robot half-extents + clearance margin for the OBB check
+        double hx = robot_length_ / 2.0 + proj_clearance_;  // front/back
+        double hy = robot_width_  / 2.0 + proj_clearance_;   // left/right
+
+        // Transform base_link obstacle points to odom for visualization storage
+        double rcy = std::cos(robot_yaw_), rsy = std::sin(robot_yaw_);
 
         double x = 0.0, y = 0.0, th = 0.0;
         double dt = proj_dt_;
@@ -1269,15 +1540,26 @@ private:
             th += av * dt;
             t += dt;
 
-            double min_d2 = std::numeric_limits<double>::infinity();
+            // Store pose in odom frame for marker visualization
+            double odom_x = robot_x_ + x * rcy - y * rsy;
+            double odom_y = robot_y_ + x * rsy + y * rcy;
+            double odom_th = robot_yaw_ + th;
+
+            // Transform obstacles into the projected robot frame and check OBB
+            double ct = std::cos(-th), st = std::sin(-th);
+            bool hit = false;
             for (int k = 0; k < nobs; ++k) {
-                double ddx = olx[k] - x;
-                double ddy = oly[k] - y;
-                double d2 = ddx * ddx + ddy * ddy;
-                if (d2 < min_d2) min_d2 = d2;
+                double dx = olx[k] - x;
+                double dy = oly[k] - y;
+                double lx = dx * ct - dy * st;
+                double ly = dx * st + dy * ct;
+                if (std::fabs(lx) < hx && std::fabs(ly) < hy) {
+                    hit = true;
+                    break;
+                }
             }
-            double cl = std::sqrt(min_d2);
-            if (cl - eff_radius < proj_clearance_) {
+            collision_viz_.push_back({odom_x, odom_y, odom_th, hit});
+            if (hit) {
                 double frac = std::max(0.0, t / proj_horizon_);
                 out_speed = std::max(0.0, lv * frac * 0.4);
                 return false;
@@ -1391,12 +1673,14 @@ private:
         double px = robot_x_, py = robot_y_;
         if (!last_bc_valid_) {
             breadcrumbs_.push_back({px, py});
+            bc_log_.push_back({px, py, false});
             last_bc_x_ = px; last_bc_y_ = py;
             last_bc_valid_ = true;
             return;
         }
         if (std::hypot(px - last_bc_x_, py - last_bc_y_) >= breadcrumb_spacing_) {
             breadcrumbs_.push_back({px, py});
+            bc_log_.push_back({px, py, false});
             last_bc_x_ = px; last_bc_y_ = py;
             if (static_cast<int>(breadcrumbs_.size()) > 50) {
                 breadcrumbs_.erase(breadcrumbs_.begin(),
@@ -1430,22 +1714,30 @@ private:
             in_recovery_ = true;
             recovery_start_ = now;
             recovery_count_++;
-            int back_n = std::min(3 + recovery_count_ / 3, static_cast<int>(breadcrumbs_.size()));
+            int back_n = std::min(5 * recovery_count_, static_cast<int>(breadcrumbs_.size()));
+
+            // Build recovery trail: the last back_n breadcrumbs in reverse order
+            recovery_trail_.clear();
+            recovery_trail_idx_ = 0;
             if (back_n >= 1 && static_cast<int>(breadcrumbs_.size()) >= back_n) {
-                int idx = static_cast<int>(breadcrumbs_.size()) - back_n;
-                recovery_target_x_ = breadcrumbs_[idx].first;
-                recovery_target_y_ = breadcrumbs_[idx].second;
-                recovery_target_valid_ = true;
+                int start = static_cast<int>(breadcrumbs_.size()) - 1;
+                int end = static_cast<int>(breadcrumbs_.size()) - back_n;
+                for (int i = start; i >= end; --i) {
+                    recovery_trail_.push_back(breadcrumbs_[i]);
+                }
+                // Mark removed breadcrumbs as bad in full log
+                int log_sz = static_cast<int>(bc_log_.size());
+                for (int i = 0; i < back_n && (log_sz - 1 - i) >= 0; ++i) {
+                    bc_log_[log_sz - 1 - i].bad = true;
+                }
                 breadcrumbs_.resize(breadcrumbs_.size() - back_n);
-            } else {
-                recovery_target_valid_ = false;
             }
-            ROS_WARN("A*: recovery #%d (backtrack %d)", recovery_count_, back_n >= 1 ? back_n : 0);
+            ROS_WARN("A*: recovery #%d (trail %zu waypoints)", recovery_count_, recovery_trail_.size());
         }
 
         if (now - recovery_start_ > recovery_max_time_) {
             in_recovery_ = false;
-            recovery_target_valid_ = false;
+            recovery_trail_.clear();
             consecutive_stops_ = 0;
             spin_count_ = 0;
             last_plan_time_ = 0.0;
@@ -1455,47 +1747,101 @@ private:
         geometry_msgs::Twist cmd;
         double obs_d = minObs();
 
-        // Collision guard: obstacle inside footprint
+        // Collision guard: obstacle inside footprint — reverse away
         if (obs_d < robot_radius_ - 0.02) {
-            ROS_WARN_THROTTLE(1.0, "A*: recovery -- obstacle at %.2fm, escape fwd", obs_d);
-            double fwd = fwdMin(1.05);
-            if (fwd > robot_radius_) {
-                cmd.linear.x = 0.2;
+            ROS_WARN_THROTTLE(1.0, "A*: recovery -- obstacle at %.2fm, reversing", obs_d);
+            double rc = rearClear();
+            if (rc > robot_radius_ + 0.05) {
+                cmd.linear.x = -0.3;
             }
             cmd_pub_.publish(cmd);
             return;
         }
 
-        double rc = rearClear();
-        bool rear_ok = rc > robot_radius_ + 0.05;
+        // No trail — blind reverse (no rear LIDAR coverage, so always allow)
+        if (recovery_trail_.empty() || recovery_trail_idx_ >= static_cast<int>(recovery_trail_.size())) {
+            cmd.linear.x = -0.10;
+            cmd_pub_.publish(cmd);
+            return;
+        }
 
-        if (!recovery_target_valid_) {
-            if (rear_ok) cmd.linear.x = -0.3;
-        } else {
-            double ddx = recovery_target_x_ - robot_x_;
-            double ddy = recovery_target_y_ - robot_y_;
-            if (std::hypot(ddx, ddy) < 0.3) {
+        // Follow trail waypoint by waypoint
+        double tx = recovery_trail_[recovery_trail_idx_].first;
+        double ty = recovery_trail_[recovery_trail_idx_].second;
+        double ddx = tx - robot_x_;
+        double ddy = ty - robot_y_;
+        double wp_dist = std::hypot(ddx, ddy);
+
+        // Advance to next waypoint if close enough
+        if (wp_dist < 0.25) {
+            recovery_trail_idx_++;
+            if (recovery_trail_idx_ >= static_cast<int>(recovery_trail_.size())) {
+                // Finished trail
                 in_recovery_ = false;
-                recovery_target_valid_ = false;
+                recovery_trail_.clear();
                 consecutive_stops_ = 0;
                 spin_count_ = 0;
                 last_plan_time_ = 0.0;
                 return;
             }
-            double err = normalizeAngle(std::atan2(ddy, ddx) - robot_yaw_);
-            if (std::fabs(err) > 2.0) {
-                if (rear_ok) cmd.linear.x = -0.3;
-            } else {
-                double fwd = fwdMin(1.05);
-                if (fwd > robot_radius_ + 0.1) {
-                    cmd.linear.x = 0.25;
-                    cmd.angular.z = clampd(2.0 * err, -max_ang_, max_ang_);
-                } else if (rear_ok) {
-                    cmd.linear.x = -0.2;
-                }
+            tx = recovery_trail_[recovery_trail_idx_].first;
+            ty = recovery_trail_[recovery_trail_idx_].second;
+            ddx = tx - robot_x_;
+            ddy = ty - robot_y_;
+        }
+
+        // Reverse toward waypoint — steer while backing up, never turn around
+        // No rearClear() gate: LIDAR has no rear coverage, check is meaningless
+        double err = normalizeAngle(std::atan2(ddy, ddx) - robot_yaw_);
+        double rear_err = normalizeAngle(err + M_PI);  // 0 = waypoint directly behind
+        cmd.linear.x = -0.10;
+        cmd.angular.z = clampd(1.0 * rear_err, -0.33, 0.33);
+        cmd_pub_.publish(cmd);
+    }
+
+    // -----------------------------------------------------------------------
+    // Breadcrumb trail persistence
+    // -----------------------------------------------------------------------
+    void saveBreadcrumbs() {
+        char path[256];
+        std::snprintf(path, sizeof(path), "/tmp/nav_logs/breadcrumbs_w%d.csv", world_idx_);
+        std::ofstream f(path, std::ios::out | std::ios::trunc);
+        if (!f.is_open()) return;
+        f << "seq,x,y,status\n";
+        for (int i = 0; i < static_cast<int>(bc_log_.size()); ++i) {
+            f << i << "," << bc_log_[i].x << "," << bc_log_[i].y
+              << "," << (bc_log_[i].bad ? "bad" : "good") << "\n";
+        }
+        f.close();
+        ROS_INFO("A*: saved %zu breadcrumbs to %s", bc_log_.size(), path);
+    }
+
+    void loadBreadcrumbs() {
+        char path[256];
+        std::snprintf(path, sizeof(path), "/tmp/nav_logs/breadcrumbs_w%d.csv", world_idx_);
+        std::ifstream f(path);
+        if (!f.is_open()) {
+            ROS_WARN("A*: no breadcrumb file at %s", path);
+            repeat_breadcrumb_ = false;
+            return;
+        }
+        std::string line;
+        std::getline(f, line);  // skip header
+        loaded_good_trail_.clear();
+        loaded_bad_bcs_.clear();
+        while (std::getline(f, line)) {
+            int seq; double x, y; char status[16];
+            if (std::sscanf(line.c_str(), "%d,%lf,%lf,%15s", &seq, &x, &y, status) == 4) {
+                if (std::string(status) == "good")
+                    loaded_good_trail_.push_back({x, y});
+                else
+                    loaded_bad_bcs_.push_back({x, y});
             }
         }
-        cmd_pub_.publish(cmd);
+        using_loaded_trail_ = !loaded_good_trail_.empty();
+        loaded_trail_idx_ = 0;
+        ROS_INFO("A*: loaded %zu good + %zu bad breadcrumbs from %s",
+                 loaded_good_trail_.size(), loaded_bad_bcs_.size(), path);
     }
 
     // -----------------------------------------------------------------------
@@ -1594,7 +1940,7 @@ private:
     void endDeadlockEscape() {
         deadlock_escape_ = false;
         in_recovery_ = false;
-        recovery_target_valid_ = false;
+        recovery_trail_.clear();
         consecutive_stops_ = 0;
         spin_count_ = 0;
         path_.clear();
@@ -1614,11 +1960,12 @@ private:
         if (!log_file_.is_open()) return;
         char buf[512];
         std::snprintf(buf, sizeof(buf),
-            "%.3f,%.3f,%.3f,%.2f,%.3f,%.3f,%.3f,%.3f,%.3f,%.2f,%.2f,%.3f,%s,%s,%d,%.3f,%d,%d,%d,%d\n",
+            "%.3f,%.3f,%.3f,%.2f,%.3f,%.3f,%.3f,%.3f,%.3f,%.2f,%.2f,%.3f,%s,%s,%d,%.3f,%d,%d,%d,%d,%d,%d\n",
             ros::Time::now().toSec(), robot_x_, robot_y_, robot_yaw_,
             lv, av, o, f, cl, tx, ty, ae,
             st.c_str(), branch.c_str(), pl, d,
-            consecutive_stops_, spin_count_, plan_fail_count_, recovery_count_);
+            consecutive_stops_, spin_count_, plan_fail_count_, recovery_count_,
+            static_cast<int>(bc_log_.size()), using_loaded_trail_ ? 1 : 0);
         log_file_ << buf;
         log_file_.flush();
     }

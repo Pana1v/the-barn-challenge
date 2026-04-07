@@ -9,6 +9,7 @@ From: osrf/ros:noetic-desktop-full
 
 %post -c /bin/bash
     apt-get -y update && apt-get -y install --no-install-recommends \
+        git \
         python3-pip \
         python3-rosdep \
         python3-rosinstall \
@@ -26,6 +27,7 @@ From: osrf/ros:noetic-desktop-full
         ros-noetic-pointgrey-camera-description \
         ros-noetic-hector-gazebo-plugins \
         ros-noetic-sick-tim \
+        ros-noetic-gmapping \
         && rm -rf /var/lib/apt/lists/*
 
     pip3 install defusedxml rospkg netifaces numpy scipy
@@ -44,7 +46,8 @@ From: osrf/ros:noetic-desktop-full
     source /opt/ros/noetic/setup.bash
     cd /jackal_ws
     rosdep update
-    rosdep install -y --from-paths src --ignore-src --rosdistro=noetic
+    rosdep install -y --from-paths src --ignore-src --rosdistro=noetic \
+        --skip-keys="rosdoc_lite cpr_onav_description"
 
     # Fix C++17 requirement for Gazebo 11 headers
     sed -i 's/set(CMAKE_CXX_STANDARD .*/set(CMAKE_CXX_STANDARD 17)/' \

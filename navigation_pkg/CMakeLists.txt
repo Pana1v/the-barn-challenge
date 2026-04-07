@@ -10,6 +10,8 @@ find_package(catkin REQUIRED COMPONENTS
   geometry_msgs
   sensor_msgs
   nav_msgs
+  visualization_msgs
+  robot_localization
 )
 find_package(Eigen3 REQUIRED)
 
