@@ -40,8 +40,10 @@ From: osrf/ros:noetic-desktop-full
     git clone --branch release/noetic/flir_camera_description/0.2.5-1 \
         https://github.com/ros-drivers-gbp/flir_camera_driver-release.git flir_camera_description
 
-    # Copy navigation_pkg (SNAP planner) into workspace
+    # Copy navigation_pkg (SNAP planner) into workspace and suppress the original
     cp -r /jackal_ws/src/the-barn-challenge/navigation_pkg /jackal_ws/src/navigation_pkg
+    rm -f /jackal_ws/src/navigation_pkg/CATKIN_IGNORE
+    touch /jackal_ws/src/the-barn-challenge/navigation_pkg/CATKIN_IGNORE
 
     source /opt/ros/noetic/setup.bash
     cd /jackal_ws
