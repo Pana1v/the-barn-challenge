@@ -21,7 +21,7 @@ nav_astar:
   # Forward projection (collision avoidance)
   proj_dt: 0.1
   proj_horizon: 0.4
-  proj_clearance: 0.04
+  proj_clearance: 0.06
 
   # Planning
   replan_interval: 5.0
@@ -37,19 +37,19 @@ nav_astar:
   analytic_heading_tol: 0.4     # heading tolerance (rad) for analytic expansion (~23°)
   analytic_cost_limit: 0.8      # reject analytic path if any cell >= UNKNOWN
   hybrid_h_weight: 0.5           # heuristic weight (<1 = explore more, find wider paths)
-  obstacle_cost_weight: 15.0    # weight on costmap proximity in A* expansion
+  obstacle_cost_weight: 9.0     # weight on costmap proximity in A* expansion
   steer_penalty: 0.05           # penalty for steering vs going straight
 
   # Safety
   safe_margin: 0.02
-  stop_clearance: 0.01
-  slow_clearance: 0.10
+  stop_clearance: 0.02
+  slow_clearance: 0.18
 
   # Recovery
   breadcrumb_spacing: 0.3
   stuck_check_interval: 20.0
   stuck_threshold: 0.3
-  recovery_max_time: 6.0
+  recovery_max_time: 20.0
   collision_stop_threshold: 12
   spin_recovery_threshold: 40
   progress_window: 15.0
