@@ -1,0 +1,57 @@
+nav_astar:
+  # Grid & Inflation
+  grid_resolution: 0.05     # 5cm cells
+  local_size: 12.0           # grid extent in meters (centered on robot)
+  inflation_radius: 0.22
+  cost_radius: 0.60
+
+  # Robot dimensions
+  robot_length: 0.42
+  robot_width: 0.31
+
+  # Controller
+  max_linear_vel: 1.5
+  max_angular_vel: 1.0
+  max_angular_accel: 4.0
+  Kp_ang: 3.5
+  Kd_ang: 0.3
+  align_threshold: 1.0
+  accel_limit: 0.6
+
+  # Forward projection (collision avoidance)
+  proj_dt: 0.1
+  proj_horizon: 0.4
+  proj_clearance: 0.06
+
+  # Planning
+  replan_interval: 5.0
+  goal_tolerance: 0.01
+  checkpoint_reach_dist: 0.35
+
+  # Hybrid A*
+  hybrid_step_size: 0.15        # arc length per expansion (meters) — small for narrow corridors
+  hybrid_num_steer: 7           # discrete steering angles (odd: includes straight)
+  hybrid_heading_bins: 72       # theta discretization (72 = 5° bins)
+  hybrid_max_steer: 0.8         # max curvature (rad/m), ~min turning radius 1.25m
+  hybrid_analytic_dist: 1.5     # only try straight-line shortcut in last 1.5m
+  analytic_heading_tol: 0.4     # heading tolerance (rad) for analytic expansion (~23°)
+  analytic_cost_limit: 0.8      # reject analytic path if any cell >= UNKNOWN
+  hybrid_h_weight: 0.5           # heuristic weight (<1 = explore more, find wider paths)
+  obstacle_cost_weight: 9.0     # weight on costmap proximity in A* expansion
+  steer_penalty: 0.05           # penalty for steering vs going straight
+
+  # Safety
+  safe_margin: 0.02
+  stop_clearance: 0.02
+  slow_clearance: 0.18
+
+  # Recovery
+  breadcrumb_spacing: 0.3
+  stuck_check_interval: 20.0
+  stuck_threshold: 0.3
+  recovery_max_time: 20.0
+  collision_stop_threshold: 12
+  spin_recovery_threshold: 40
+  progress_window: 15.0
+  progress_min: 0.3
+  repeat_breadcrumb: false

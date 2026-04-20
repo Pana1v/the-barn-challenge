@@ -1,5 +1,5 @@
 Bootstrap: docker
-From: ros:melodic
+From: osrf/ros:noetic-desktop-full
 
 %setup
     mkdir -p ${SINGULARITY_ROOTFS}/jackal_ws/src
@@ -8,24 +8,56 @@ From: ros:melodic
     . /jackal_ws/src/the-barn-challenge
 
 %post -c /bin/bash
-    apt -y update; apt-get -y install python3-venv
-    python3 -m venv /venv
-    export PATH="/venv/bin:$PATH"
-    pip3 install --upgrade pip
-    pip3 install defusedxml rospkg netifaces numpy
-    
-    cd /jackal_ws/src
-    git clone https://github.com/jackal/jackal.git --branch melodic-devel
-    git clone https://github.com/jackal/jackal_simulator.git --branch melodic-devel
-    git clone https://github.com/jackal/jackal_desktop.git --branch melodic-devel
-    git clone https://github.com/utexas-bwi/eband_local_planner.git
+    apt-get -y update && apt-get -y install --no-install-recommends \
+        git \
+        python3-pip \
+        python3-rosdep \
+        python3-rosinstall \
+        python3-rosinstall-generator \
+        python3-wstool \
+        build-essential \
+        ros-noetic-navigation \
+        ros-noetic-robot-localization \
+        ros-noetic-interactive-marker-twist-server \
+        ros-noetic-teleop-twist-joy \
+        ros-noetic-teleop-twist-keyboard \
+        ros-noetic-velodyne-simulator \
+        ros-noetic-twist-mux \
+        ros-noetic-lms1xx \
+        ros-noetic-pointgrey-camera-description \
+        ros-noetic-hector-gazebo-plugins \
+        ros-noetic-sick-tim \
+        ros-noetic-gmapping \
+        && rm -rf /var/lib/apt/lists/*
 
-    source /opt/ros/melodic/setup.bash
-    cd ..
-    rosdep init; rosdep update
-    rosdep install -y --from-paths . --ignore-src --rosdistro=melodic
-    source devel/setup.bash
-    catkin_make
+    pip3 install defusedxml rospkg netifaces numpy scipy
+
+    cd /jackal_ws/src
+    git clone --branch noetic-devel https://github.com/jackal/jackal.git
+    git clone --branch melodic-devel https://github.com/jackal/jackal_simulator.git
+    git clone --branch melodic-devel https://github.com/jackal/jackal_desktop.git
+    git clone https://github.com/utexas-bwi/eband_local_planner.git
+    git clone --branch release/noetic/flir_camera_description/0.2.5-1 \
+        https://github.com/ros-drivers-gbp/flir_camera_driver-release.git flir_camera_description
+
+    # Copy navigation_pkg (SNAP planner) into workspace and suppress the original
+    cp -r /jackal_ws/src/the-barn-challenge/navigation_pkg /jackal_ws/src/navigation_pkg
+    rm -f /jackal_ws/src/navigation_pkg/CATKIN_IGNORE
+    touch /jackal_ws/src/the-barn-challenge/navigation_pkg/CATKIN_IGNORE
+
+    source /opt/ros/noetic/setup.bash
+    cd /jackal_ws
+    rosdep update
+    rosdep install -y --from-paths src --ignore-src --rosdistro=noetic \
+        --skip-keys="rosdoc_lite cpr_onav_description"
+
+    # Fix C++17 requirement for Gazebo 11 headers
+    sed -i 's/set(CMAKE_CXX_STANDARD .*/set(CMAKE_CXX_STANDARD 17)/' \
+        /jackal_ws/src/the-barn-challenge/jackal_helper/CMakeLists.txt
+
+    catkin_make_isolated --install -DCMAKE_BUILD_TYPE=Release
 
 %environment
-    export PATH="/venv/bin:$PATH"
+    export JACKAL_LASER=1
+    export JACKAL_LASER_MODEL=ust10
+    export JACKAL_LASER_OFFSET="-0.065 0 0.01"
