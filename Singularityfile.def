@@ -55,6 +55,9 @@ From: osrf/ros:noetic-desktop-full
     sed -i 's/set(CMAKE_CXX_STANDARD .*/set(CMAKE_CXX_STANDARD 17)/' \
         /jackal_ws/src/the-barn-challenge/jackal_helper/CMakeLists.txt
 
+    # Upstream CMakeLists installs a urdf/ dir that isn't in the repo; create empty so install step succeeds
+    mkdir -p /jackal_ws/src/the-barn-challenge/jackal_helper/urdf
+
     catkin_make_isolated --install -DCMAKE_BUILD_TYPE=Release
 
 %environment
